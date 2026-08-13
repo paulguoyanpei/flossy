@@ -42,7 +42,7 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["HF_HUB_OFFLINE"] = "1"
     common = ["--model", model, "--prompt", "essay about computing history", "--s", sval,
-              "-n", ntok, "--min-new-tokens", ntok, "--host", "127.0.0.1", "--port", PORT, "--shm-name", SHM]
+              "-n", ntok, "--host", "127.0.0.1", "--port", PORT, "--shm-name", SHM]
     vargs = ["--workers", workers, "--threads", vthreads]
     ctx = mp.get_context("spawn")
     v = ctx.Process(target=_run, args=("verifier", common + vargs))

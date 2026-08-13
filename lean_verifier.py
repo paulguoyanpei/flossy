@@ -53,6 +53,31 @@ def _batched_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
     return xn * weight.view(*wshape)
 
 
+def _append_growing(buf: torch.Tensor | None, length: int, new: torch.Tensor, dim: int) -> torch.Tensor:
+    """Append ``new`` to ``buf`` along ``dim``, amortized O(1) per call.
+
+    ``torch.cat([buf, new], dim)`` reallocates and copies the *entire* existing
+    buffer on every single call -- for a cache that grows by one row per decode
+    step, that turns an intended O(1)-per-step append into an O(kv_len) copy
+    every step (O(kv_len^2) over a whole generation). Instead, grow capacity by
+    doubling (like list/vector append) and write the new rows in place; only
+    the O(log kv_len) doubling events touch the old data. ``length`` is the
+    valid prefix size before this append (capacity beyond it may be garbage);
+    callers must read back only ``buf.narrow(dim, 0, length + new.shape[dim])``.
+    """
+    add = new.shape[dim]
+    if buf is None or length + add > buf.shape[dim]:
+        new_cap = max((buf.shape[dim] if buf is not None else 0) * 2, length + add, 64)
+        shape = list(new.shape)
+        shape[dim] = new_cap
+        grown = new.new_empty(shape)
+        if buf is not None and length > 0:
+            grown.narrow(dim, 0, length).copy_(buf.narrow(dim, 0, length))
+        buf = grown
+    buf.narrow(dim, length, add).copy_(new)
+    return buf
+
+
 class LeanVerifier:
     def __init__(self, model, s: int, tol: float, generator=None, layers: range | None = None,
                  checks_lmhead: bool | None = None):
@@ -118,20 +143,24 @@ class LeanVerifier:
                                                 name="lm_head", generator=generator)
         self.bv = BatchedVerifier(self.ctx, targets, checkers)
 
-        self.cache_k = None  # (L, n_kv, kv_len, head_dim)
         # FLOSSY cache-reuse (paper Sec 5.2): the value-check projection r is fixed
         # for the whole request (secret -> still sound, paper App. D) so V.r can be
         # cached incrementally -- each step only the new rows v_t.r are computed and
         # appended, instead of recomputing the full V.r (the dominant ~L*head_dim*s
         # term). cache_Vr is kept at the n_kv (pre-GQA) level.
         self.rv = make_r(self.head_dim, self.s, generator=self.generator)  # (head_dim, s), fixed
-        self.cache_Vr = None  # (L, n_kv, kv_len, s)
-        # Stage 2 (paper 5.2, opt-in): when the prover ships raw QK^T scores, the
-        # verifier checks them via a cached K^T b instead of recomputing q.K^T.
-        # cache_Kb accumulates sum_j k_j^T b_j; b_stacked keeps the per-position
-        # binary challenges to form <s_t, b>.
-        self.cache_Kb = None  # (L, n_kv, head_dim, s)
-        self.b_stacked = None  # (kv_len, s), per-position +/-1
+        # cache_Vr / b_stacked grow via _append_growing (amortized-doubling
+        # capacity, in-place writes) rather than torch.cat, which would
+        # reallocate + copy the entire cache on every single decode step. Only
+        # the first `self.pos` entries along the growth dim are valid; the
+        # rest of the allocated capacity may be garbage.
+        self.cache_Vr = None  # (L, B, n_kv, >=kv_len, s), valid prefix [:, :, :, :self.pos]
+        # The prover ships raw QK^T scores (paper Sec 5.2 stage-2); the verifier
+        # checks them via a cached K^T b instead of recomputing q.K^T. cache_Kb
+        # accumulates sum_j k_j^T b_j; b_stacked keeps the per-position binary
+        # challenges to form <s_t, b>.
+        self.cache_Kb = None  # (L, B, n_kv, head_dim, s)
+        self.b_stacked = None  # (>=kv_len, s), valid prefix [:self.pos]
         self.pos = 0
         self.next_tokens: torch.Tensor | None = None
 
@@ -218,8 +247,8 @@ class LeanVerifier:
         o_in = attn_out.transpose(2, 3).reshape(L, B, S, -1)  # (L,B,S,h*hd)
         self._check("o_proj", o_in, o_out)
 
-        # --- attention check (scores from q/K, or transferred + cached K^T b) ---
-        self._attention_check(gm, position_ids, B, S, attn_out, "attn_scores" in groups)
+        # --- attention check (transferred scores + cached K^T b) ---
+        self._attention_check(gm, position_ids, B, S, attn_out)
 
         # --- lm_head: only the owning worker checks it; ALL derive the next token ---
         lm_out = groups["lm_head"].float()      # (1, B, S_kept, vocab)
@@ -246,7 +275,7 @@ class LeanVerifier:
         cr = torch.bmm(Yr, g["r"])
         self.bv._record_batch(g["names"], abr, cr, Yr)
 
-    def _attention_check(self, g, position_ids, B, S, attn_out, has_scores):
+    def _attention_check(self, g, position_ids, B, S, attn_out):
         # All attention tensors carry an explicit batch dim B (attention does not
         # mix batch elements), so caches are (L, B, ...). Per-layer ratios reduce
         # over B as well, so a fault in any batch element fails its layer's check.
@@ -269,42 +298,29 @@ class LeanVerifier:
 
         # --- cache reuse: append the new V.r rows only (paper 5.2) ---
         new_Vr = torch.matmul(v, self.rv)  # (L, B, n_kv, S, s)
-        if self.cache_Vr is None:
-            self.cache_Vr = new_Vr
-        else:
-            self.cache_Vr = torch.cat([self.cache_Vr, new_Vr], dim=3)
-        kv = self.cache_Vr.shape[3]
+        self.cache_Vr = _append_growing(self.cache_Vr, self.pos, new_Vr, dim=3)
+        kv = self.pos + S
 
-        if has_scores:
-            # Stage 2: GPU shipped raw QK^T -> check it via cached K^T b, then
-            # softmax the (verified) transferred scores. Avoids the O(L*head_dim)
-            # q.K^T recompute (residual is O(L*s) like the paper).
-            b_new = make_r(S, self.s, generator=self.generator)  # (S, s), +/-1 per new pos
-            new_Kb = torch.einsum("lbnsd,se->lbnde", k, b_new)  # (L, B, n_kv, hd, s)
-            if self.cache_Kb is None:
-                self.cache_Kb = new_Kb
-                self.b_stacked = b_new
-            else:
-                self.cache_Kb = self.cache_Kb + new_Kb
-                self.b_stacked = torch.cat([self.b_stacked, b_new], dim=0)
-            s_raw = g("attn_scores")[..., :kv]  # (L, B, n_heads, S, kv), trim static-cache pad
-            # QK check: | <s_raw, b> - q (K^T b) | < tol * ||s_raw||_2
-            sb = torch.einsum("lbhsk,ke->lbhse", s_raw, self.b_stacked)  # (L,B,h,S,s)
-            Kb = self.cache_Kb.repeat_interleave(self.n_rep, dim=2)  # (L,B,h,hd,s)
-            qKb = torch.einsum("lbhsd,lbhde->lbhse", q, Kb)  # (L,B,h,S,s)
-            qk_l2 = s_raw.norm(p=2, dim=-1)  # (L,B,h,S)
-            qk_diff = (sb - qKb).abs().amax(dim=-1)  # (L,B,h,S)
-            qk_ratio = (qk_diff / (qk_l2 + 1e-9)).flatten(1).amax(dim=-1)  # (L,)
-            self.bv._emit([f"{i}.attn_scores" for i in self.layer_ids], qk_ratio)
-            scores = s_raw * self.scaling
+        # GPU shipped raw QK^T -> check it via cached K^T b, then softmax the
+        # (verified) transferred scores. Avoids the O(L*head_dim) q.K^T
+        # recompute (residual is O(L*s) like the paper).
+        b_new = make_r(S, self.s, generator=self.generator)  # (S, s), +/-1 per new pos
+        new_Kb = torch.einsum("lbnsd,se->lbnde", k, b_new)  # (L, B, n_kv, hd, s)
+        if self.cache_Kb is None:
+            self.cache_Kb = new_Kb
         else:
-            # Stage 1: recompute scores from q/K (no transfer).
-            if self.cache_k is None:
-                self.cache_k = k
-            else:
-                self.cache_k = torch.cat([self.cache_k, k], dim=3)
-            K = self.cache_k.repeat_interleave(self.n_rep, dim=2)  # (L, B, n_heads, kv, hd)
-            scores = torch.matmul(q, K.transpose(-1, -2)) * self.scaling  # (L,B,h,S,kv)
+            self.cache_Kb = self.cache_Kb + new_Kb
+        self.b_stacked = _append_growing(self.b_stacked, self.pos, b_new, dim=0)
+        s_raw = g("attn_scores")[..., :kv]  # (L, B, n_heads, S, kv), trim static-cache pad
+        # QK check: | <s_raw, b> - q (K^T b) | < tol * ||s_raw||_2
+        sb = torch.einsum("lbhsk,ke->lbhse", s_raw, self.b_stacked.narrow(0, 0, kv))  # (L,B,h,S,s)
+        Kb = self.cache_Kb.repeat_interleave(self.n_rep, dim=2)  # (L,B,h,hd,s)
+        qKb = torch.einsum("lbhsd,lbhde->lbhse", q, Kb)  # (L,B,h,S,s)
+        qk_l2 = s_raw.norm(p=2, dim=-1)  # (L,B,h,S)
+        qk_diff = (sb - qKb).abs().amax(dim=-1)  # (L,B,h,S)
+        qk_ratio = (qk_diff / (qk_l2 + 1e-9)).flatten(1).amax(dim=-1)  # (L,)
+        self.bv._emit([f"{i}.attn_scores" for i in self.layer_ids], qk_ratio)
+        scores = s_raw * self.scaling
         if S > 1:
             qp = torch.arange(self.pos, self.pos + S).unsqueeze(-1)
             kp = torch.arange(kv).unsqueeze(0)
@@ -312,7 +328,7 @@ class LeanVerifier:
         probs = F.softmax(scores, dim=-1)
 
         # value check via the cached V.r (no full V.r recompute): abr = P @ (V.r)
-        Vr = self.cache_Vr.repeat_interleave(self.n_rep, dim=2)  # (L, B, n_heads, kv, s)
+        Vr = self.cache_Vr.narrow(3, 0, kv).repeat_interleave(self.n_rep, dim=2)  # (L, B, n_heads, kv, s)
         abr = torch.matmul(probs, Vr)  # (L,B,h,S,s)
         cr = torch.matmul(attn_out, self.rv)  # (L,B,h,S,s)
         names = [f"{i}.attn_out" for i in self.layer_ids]

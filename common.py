@@ -22,8 +22,6 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--batch", type=int, default=1, help="batch size (replicates the prompt)")
     ap.add_argument("-n", "--max-new-tokens", type=int, default=32)
-    ap.add_argument("--min-new-tokens", type=int, default=0,
-                    help="force at least this many new tokens (set == max for fixed-length benchmarking)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0, help="0 = verifier picks; prover must match")
     ap.add_argument("--port-file", default=None, help="verifier writes / prover reads the chosen port here")
@@ -36,10 +34,6 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--tol", type=float, default=0.1,
                     help="Freivalds relative tolerance; honest worst is a bounded ~0.05, faults are 0.4-1.0")
     ap.add_argument("--s", type=int, default=10, help="Freivalds projection columns")
-    ap.add_argument("--transfer-scores", action="store_true",
-                    help="prover ships raw QK^T scores (paper §5.2 stage-2). Helps LONG context "
-                         "but costs ~3ms/step at batch16 (explicit repeat_kv over the KV cache + "
-                         "QK^T matmul that fused SDPA avoids). Off => verifier recomputes q.K^T.")
     ap.add_argument("--seed", type=int, default=1234)
 
 
@@ -64,10 +58,3 @@ def build_prompt_ids(tokenizer, prompt: str, device: str) -> torch.Tensor:
     else:
         text = prompt
     return tokenizer(text, return_tensors="pt").input_ids.to(device)
-
-
-def gen_kwargs(max_new_tokens: int, min_new_tokens: int = 0) -> dict:
-    kw = dict(max_new_tokens=max_new_tokens, do_sample=False, use_cache=True, num_beams=1)
-    if min_new_tokens > 0:
-        kw["min_new_tokens"] = min_new_tokens
-    return kw

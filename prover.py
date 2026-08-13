@@ -74,9 +74,12 @@ class ProverPipeline:
         # pinned staging only needed for the non-direct (staged memcpy) path
         self.pinned = (None if self.direct_dma
                        else [torch.empty(slot_elems, dtype=ring.torch_dtype, pin_memory=True) for _ in range(n_slots)])
+        # direct_dma uses graph_sink()/sink()'s direct-dma branch exclusively,
+        # neither of which ever reads gpu_staging -- only the non-direct sink()
+        # path does. Skip the n_slots*slot_elems allocation when it can't be hit.
         self.gpu_staging = (
             [torch.empty(slot_elems, dtype=ring.torch_dtype, device="cuda") for _ in range(n_slots)]
-            if use_gpu_staging
+            if use_gpu_staging and not self.direct_dma
             else None
         )
         # per-slot device shadow buffers for the CUDA-graph path: the in-graph cat
@@ -86,6 +89,14 @@ class ProverPipeline:
         # the shadow -> shm on a side stream so the PCIe transfer overlaps the next
         # replay. Allocated lazily (needs the captured staging size). Slot reuse is
         # already gated by _await_slot (ack => DMA done), so no extra event needed.
+        #
+        # The prefill call (step 0) and the decode replay calls pass staging
+        # buffers of very different sizes (prefill covers the whole prompt,
+        # decode covers one token), so they get separate shadow pools: one
+        # one-off buffer for prefill, and an n_slots pool sized off decode. A
+        # single pool sized off whichever call comes first would otherwise
+        # blow up n_slots-fold to the larger of the two.
+        self.dev_shadow_prefill: torch.Tensor | None = None
         self.dev_shadow: list[torch.Tensor] | None = None
         self.free_q: queue.Queue[int] = queue.Queue()
         for i in range(n_slots):
@@ -212,9 +223,14 @@ class ProverPipeline:
         the main replay thread never blocks in a socket recv. Requires direct_dma."""
         self._await_slot(step)
         slot = step % self.n_slots
-        if self.dev_shadow is None:
-            self.dev_shadow = [torch.empty_like(staging) for _ in range(self.n_slots)]
-        shadow = self.dev_shadow[slot]
+        if step == 0:  # prefill: one-off buffer, sized to this call only
+            if self.dev_shadow_prefill is None:
+                self.dev_shadow_prefill = torch.empty_like(staging)
+            shadow = self.dev_shadow_prefill
+        else:
+            if self.dev_shadow is None:
+                self.dev_shadow = [torch.empty_like(staging) for _ in range(self.n_slots)]
+            shadow = self.dev_shadow[slot]
         cur = torch.cuda.current_stream()
         shadow[:n].copy_(staging[:n])  # d2d on the replay stream: frees `staging` fast
         self.stream.wait_stream(cur)   # side stream waits only for the d2d, not the next replay
@@ -396,8 +412,7 @@ def main() -> int:
     port = read_port(args)
     ctrl = connect_with_retry(args.host, port)
 
-    slot_elems = estimate_slot_elems(model.config, batch, prompt_len, args.max_new_tokens,
-                                     transfer_scores=args.transfer_scores)
+    slot_elems = estimate_slot_elems(model.config, batch, prompt_len, args.max_new_tokens)
     ring = SharedRing.create(args.shm_name, args.slots, slot_elems, dtype="float16")
     cur_name = args.shm_name + "_cur"
     cursors = Cursors.create(cur_name)
@@ -416,7 +431,6 @@ def main() -> int:
     captured: dict = {}
     assert pipe.direct_dma, "cuda-graph requires direct DMA (cudaHostRegister failed?)"
     ctx = FlossyContext(role="prover", s=args.s, tol=args.tol,
-                        record_scores=args.transfer_scores,
                         sink=lambda st, b: captured.__setitem__("buf", b))
     instrument(model, ctx)
 

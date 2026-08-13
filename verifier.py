@@ -258,7 +258,6 @@ def run_multi(args, ctrl, hello, cursors, cursor_mode) -> dict:
         src_t = compute_t = 0.0
         cap = 0.0
         steps = 0
-        last_groups = None
 
         def barrier(step):  # wait until all workers finished `step`
             for _ in range(args.workers):
@@ -313,7 +312,7 @@ def run_multi(args, ctrl, hello, cursors, cursor_mode) -> dict:
                     break
                 gmeta = None
                 if not msg.get("same"):
-                    last_groups = gmeta = msg["groups"]
+                    gmeta = msg["groups"]
                 for q in task_qs:
                     q.put((msg["step"], msg["slot"], gmeta))
                 prev = msg["step"]

@@ -242,15 +242,12 @@ class Cursors:
             pass
 
 
-def estimate_slot_elems(config, batch: int, prompt_len: int, max_new_tokens: int, margin: float = 1.25,
-                        transfer_scores: bool = True) -> int:
+def estimate_slot_elems(config, batch: int, prompt_len: int, max_new_tokens: int, margin: float = 1.25) -> int:
     """Upper bound on the flattened fp32 element count for a single decode step.
 
     Worst case is the prefill (q = kv = prompt_len) for the linear and score
     terms; the last decode (q = 1, kv = prompt_len + max_new_tokens) is also
-    considered. Margin covers rounding / chat-template growth. When the prover
-    does not ship raw QK^T scores (``transfer_scores=False``) the ``attn_scores``
-    term -- the dominant prefill cost -- is dropped, shrinking the slot.
+    considered. Margin covers rounding / chat-template growth.
     """
     h = config.hidden_size
     inter = config.intermediate_size
@@ -262,8 +259,7 @@ def estimate_slot_elems(config, batch: int, prompt_len: int, max_new_tokens: int
 
     def step_elems(q: int, kv: int) -> int:
         per_layer = batch * q * (n_q * d + 2 * n_kv * d + h + 2 * inter)  # projections
-        if transfer_scores:
-            per_layer += batch * n_q * q * kv  # attn_scores
+        per_layer += batch * n_q * q * kv  # attn_scores
         per_layer += batch * n_q * q * d  # attn_out
         return n_layers * per_layer + batch * 1 * vocab  # lm_head keeps 1 position
 

@@ -50,8 +50,6 @@ def main() -> int:
     ap.add_argument("--prover-device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--tol", type=float, default=0.1)
     ap.add_argument("--s", type=int, default=10)
-    ap.add_argument("--transfer-scores", action="store_true",
-                    help="prover ships raw QK^T scores (stage-2); default off = verifier recomputes q.K^T")
     args = ap.parse_args()
 
     prover, verifier, tok = build_models(args.model, args.prover_device)
@@ -70,8 +68,7 @@ def main() -> int:
             cb.record(n, buf.fetch(n).detach().to("cpu", torch.float16))
         log.append(cb)
 
-    pctx = FlossyContext(role="prover", s=args.s, tol=args.tol,
-                         record_scores=args.transfer_scores, sink=sink)
+    pctx = FlossyContext(role="prover", s=args.s, tol=args.tol, sink=sink)
     instrument(prover, pctx)
     with torch.inference_mode():
         out = prover.generate(ids.to(args.prover_device), **gen)

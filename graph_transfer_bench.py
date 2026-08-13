@@ -18,7 +18,7 @@ import time
 
 import torch
 
-from capture import FlossyContext, StepBuffer, instrument
+from capture import FlossyContext, instrument
 from common import build_prompt_ids, load_model
 
 
