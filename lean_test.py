@@ -49,7 +49,7 @@ def main() -> int:
     ap.add_argument("-n", "--max-new-tokens", type=int, default=16)
     ap.add_argument("--prover-device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--tol", type=float, default=0.1)
-    ap.add_argument("--s", type=int, default=10)
+    ap.add_argument("--s", type=int, default=16)
     args = ap.parse_args()
 
     prover, verifier, tok = build_models(args.model, args.prover_device)

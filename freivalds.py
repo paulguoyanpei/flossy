@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 
 
-DEFAULT_S = 10  # number of random projection columns ("n_sample" in flossy)
+DEFAULT_S = 16  # number of random projection columns ("n_sample" in flossy)
 DEFAULT_TOL = 0.05  # max allowed ||A.Br - C.r||_inf / ||C||_2 per row
 
 

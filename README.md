@@ -20,6 +20,7 @@ export CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1
 ### Inference only
 
 Pure GPU inference floor (CUDA-graph decode, no verification); prints `ms/step`.
+Serves as the baseline for the end-to-end numbers below.
 
 ```bash
 python bench_gpu_sweep.py --model "$M" --batch 16 --ns 64
@@ -43,3 +44,4 @@ python run_e2e_spawn.py "$M" -n 64 --batch 16 --workers 4 --vthreads 8
 - `--batch` — batch size (the batch shares one prompt).
 - `--workers` — verifier worker processes, each owning a layer slice; **4** is the sweet spot at batch 16.
 - `--vthreads` — CPU threads per verifier worker.
+- `--s` — Freivalds projection columns (default **16**).

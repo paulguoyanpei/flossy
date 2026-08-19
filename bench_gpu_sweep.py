@@ -12,6 +12,7 @@ import time
 
 import torch
 
+from capture import FlossyContext, instrument
 from common import build_prompt_ids, load_model
 
 
@@ -22,10 +23,11 @@ def main():
     ap.add_argument("--ns", type=int, nargs="+", default=[64, 128, 256, 512])
     ap.add_argument("--batch", type=int, default=1, help="batch size (replicates the prompt)")
     args = ap.parse_args()
-    torch.set_float32_matmul_precision("high")
     dev = "cuda:0"
 
     tok, model = load_model(args.model, dev)
+    ctx = FlossyContext(role="prover", s=16, tol=0.1, sink=lambda step, buf: None)
+    instrument(model, ctx)
     ids = build_prompt_ids(tok, args.prompt, dev)
     if args.batch > 1:
         ids = ids.repeat(args.batch, 1)

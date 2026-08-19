@@ -33,7 +33,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
                          "one-time cudaHostRegister of slots*slot_size pinned memory.")
     ap.add_argument("--tol", type=float, default=0.1,
                     help="Freivalds relative tolerance; honest worst is a bounded ~0.05, faults are 0.4-1.0")
-    ap.add_argument("--s", type=int, default=10, help="Freivalds projection columns")
+    ap.add_argument("--s", type=int, default=16, help="Freivalds projection columns")
     ap.add_argument("--seed", type=int, default=1234)
 
 

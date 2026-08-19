@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=12)
     ap.add_argument("--threads", type=int, nargs="+", default=[4, 8, 16, 32])
     ap.add_argument("--layers", type=int, default=0, help="truncate to N layers (0 = all; mimics a shard)")
-    ap.add_argument("--s", type=int, default=10)
+    ap.add_argument("--s", type=int, default=16)
     ap.add_argument("--tol", type=float, default=0.1)
     ap.add_argument("--scores", action="store_true", help="include transferred attn_scores (stage-2)")
     args = ap.parse_args()
